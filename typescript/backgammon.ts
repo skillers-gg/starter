@@ -2,21 +2,24 @@
 /**
  * Skillers.gg Backgammon Agent — plays Backgammon via LLM.
  *
+ * Uses REST to join a game, then WebSocket for real-time gameplay.
+ * The server provides all legal moves — your LLM just picks the best one.
+ *
  * Quick start:
  *   export SKILLERS_API_KEY=sk_agent_xxx
  *   export OPENAI_API_KEY=sk-xxx        # or ANTHROPIC_API_KEY or GEMINI_API_KEY
  *   npx tsx typescript/backgammon.ts
  *
- * The server provides all legal moves — your LLM just picks the best one.
  * Customize strategy by editing SYSTEM_PROMPT and buildPrompt().
+ * Requires Node.js 22+ (built-in WebSocket).
  */
 
 // ── Configuration ───────────────────────────────────────────────────────────
-const API_URL      = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
-const API_KEY      = process.env.SKILLERS_API_KEY || "";
+const API_URL  = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
+const WS_URL   = process.env.SKILLERS_WS_URL || "wss://ws.skillers.gg";
+const API_KEY  = process.env.SKILLERS_API_KEY || "";
 const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
 const LLM_MODEL    = process.env.LLM_MODEL || "";
-const POLL_MS      = 1000;
 
 const DEFAULT_MODELS: Record<string, string> = {
   openai: "gpt-4o",
@@ -77,48 +80,31 @@ function parseJSON(text: string): any | null {
   return null;
 }
 
-// ── Skillers API ────────────────────────────────────────────────────────────
-
-const hdrs = () => ({ Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" });
-
-async function apiGet(path: string) {
-  const r = await fetch(`${API_URL}${path}`, { headers: hdrs() });
-  return r.json() as any;
-}
-
-async function apiPost(path: string, body: any) {
-  const r = await fetch(`${API_URL}${path}`, { method: "POST", headers: hdrs(), body: JSON.stringify(body) });
-  if (!r.ok) { const err = await r.json().catch(() => ({})) as any; throw Object.assign(new Error(err.error || r.statusText), { body: err }); }
-  return r.json() as any;
-}
-
 // ── Prompt builder ──────────────────────────────────────────────────────────
 
-function buildPrompt(stateData: any): string {
-  const s = stateData.state;
-  const side = stateData.your_side;
-  const legal: number[][][] = s.legalMoves || [];
+function buildPrompt(state: any, side: string): string {
+  const legal: number[][][] = state.legalMoves || [];
 
   const boardLines: string[] = [];
-  for (let i = 0; i < (s.board as number[]).length; i++) {
-    const v = s.board[i];
+  for (let i = 0; i < (state.board as number[]).length; i++) {
+    const v = state.board[i];
     if (v !== 0) {
       const owner = (v > 0 && side === "a") || (v < 0 && side === "b") ? "You" : "Opp";
       boardLines.push(`  Pt ${i+1}: ${Math.abs(v)} ${owner}`);
     }
   }
 
-  const myBar  = side === "a" ? s.barA : s.barB;
-  const oppBar = side === "a" ? s.barB : s.barA;
-  const myOff  = side === "a" ? s.borneOffA : s.borneOffB;
-  const oppOff = side === "a" ? s.borneOffB : s.borneOffA;
+  const myBar  = side === "a" ? state.barA : state.barB;
+  const oppBar = side === "a" ? state.barB : state.barA;
+  const myOff  = side === "a" ? state.borneOffA : state.borneOffB;
+  const oppOff = side === "a" ? state.borneOffB : state.borneOffA;
   const dir    = side === "a" ? "24→1, bear off from points 1-6" : "1→24, bear off from points 19-24";
 
   const options = legal.slice(0, 20).map((m, i) => `  ${i}: ${JSON.stringify(m)}`).join("\n");
   const extra = legal.length > 20 ? `\n  ... and ${legal.length - 20} more` : "";
 
   return `Backgammon — you are side ${side} (moving ${dir}).
-Dice: ${s.dice[0]}, ${s.dice[1]}
+Dice: ${state.dice[0]}, ${state.dice[1]}
 
 Board:
 ${boardLines.length ? boardLines.join("\n") : "  (empty)"}
@@ -133,15 +119,15 @@ Reply with ONLY: {"index": <number>}`;
 
 // ── Move decision ───────────────────────────────────────────────────────────
 
-async function decideMove(stateData: any): Promise<any> {
-  const legal: number[][][] = stateData.state.legalMoves || [];
+async function decideMove(state: any, side: string): Promise<any> {
+  const legal: number[][][] = state.legalMoves || [];
 
   if (!legal.length || (legal.length === 1 && legal[0].length === 0)) {
     return { moves: [] };
   }
 
   try {
-    const prompt = buildPrompt(stateData);
+    const prompt = buildPrompt(state, side);
     const response = await askLLM(prompt);
     const parsed = parseJSON(response);
     if (parsed?.index !== undefined) {
@@ -155,32 +141,93 @@ async function decideMove(stateData: any): Promise<any> {
   return { moves: legal[0] };
 }
 
-// ── Game loop ───────────────────────────────────────────────────────────────
+// ── WebSocket game loop ────────────────────────────────────────────────────
 
-async function playGame(gameId: string) {
-  let moves = 0;
-  while (moves < 500) {
-    await new Promise(r => setTimeout(r, POLL_MS));
-    const stateData = await apiGet(`/games/${gameId}/state`);
+function playGame(gameId: string): Promise<void> {
+  return new Promise((resolve) => {
+    const url = `${WS_URL}/parties/game-room-server/${gameId}?api_key=${API_KEY}`;
+    const ws = new WebSocket(url);
+    let side: string | null = null;
+    let moves = 0;
+    let processing = false;
+    let lastState: any = null;
+    let pingInterval: ReturnType<typeof setInterval>;
 
-    if (stateData.status !== "active") { console.log(`\nGame ended: ${stateData.status}`); return; }
-    if (!stateData.your_turn) { process.stdout.write("."); continue; }
+    ws.onopen = () => {
+      pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+      }, 25000);
+    };
 
-    const move = await decideMove(stateData);
-    console.log(`\n  Dice: ${stateData.state.dice} → ${JSON.stringify(move)}`);
+    ws.onmessage = async (event) => {
+      const msg = JSON.parse(String(event.data));
 
-    try {
-      const result = await apiPost(`/games/${gameId}/move`, move);
-      moves++;
-      if (result.gameOver) { console.log(`\nGame over after ${moves} moves! Gammon: ${result.isGammon || false}`); return; }
-    } catch (e: any) {
-      console.log(`\n  Move rejected: ${e.body?.error || e.message}`);
-      const legal = stateData.state.legalMoves || [];
-      if (legal.length && legal[0].length) {
-        try { const r = await apiPost(`/games/${gameId}/move`, { moves: legal[0] }); moves++; if (r.gameOver) return; } catch {}
+      if (msg.type === "authenticated") {
+        side = msg.side;
+        if (msg.game_id) console.log(`  Playing as side ${side}`);
+        return;
       }
-    }
-  }
+
+      if (msg.type === "state_update" && !processing) {
+        const state = msg.state;
+        lastState = state;
+        if (!side || state.turn !== side) return;
+
+        processing = true;
+        try {
+          const move = await decideMove(state, side);
+          console.log(`  Dice: ${state.dice} → ${JSON.stringify(move)}`);
+          ws.send(JSON.stringify({ type: "move", move }));
+          moves++;
+        } catch (e: any) {
+          console.error("  Error:", e.message);
+        }
+        processing = false;
+        return;
+      }
+
+      if (msg.type === "move_accepted") {
+        if (msg.gameOver) {
+          console.log(`\nGame over after ${moves} moves! Gammon: ${msg.isGammon || false}`);
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
+        }
+        return;
+      }
+
+      if (msg.type === "move_rejected") {
+        console.log(`  Move rejected: ${msg.error || "?"}`);
+        if (side && lastState) {
+          const legal = lastState.legalMoves || [];
+          if (legal.length && legal[0].length) {
+            ws.send(JSON.stringify({ type: "move", move: { moves: legal[0] } }));
+          }
+        }
+        return;
+      }
+
+      if (msg.type === "game_over") {
+        console.log(`\nGame over! Winner: ${msg.winner_id || "?"}`);
+        clearInterval(pingInterval);
+        ws.close();
+        resolve();
+        return;
+      }
+
+      if (msg.type === "error") {
+        console.log(`  WS error: ${msg.message || JSON.stringify(msg)}`);
+        if (msg.code === "invalid_key" || msg.code === "auth_required") {
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
+        }
+      }
+    };
+
+    ws.onerror = () => { clearInterval(pingInterval); resolve(); };
+    ws.onclose = () => { clearInterval(pingInterval); resolve(); };
+  });
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -191,18 +238,16 @@ async function main() {
   const model = LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER] || "?";
   console.log(`Skillers Backgammon Agent — LLM: ${LLM_PROVIDER}/${model}`);
 
-  const join = await apiPost("/games/join", { game_type: "backgammon", room_amount_cents: 0 });
-  console.log(`Game: ${join.game_id} (${join.status})`);
+  const hdrs = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
+  const joinRes = await fetch(`${API_URL}/games/join`, {
+    method: "POST", headers: hdrs,
+    body: JSON.stringify({ game_type: "backgammon", room_amount_cents: 0 }),
+  });
+  if (!joinRes.ok) { console.error("Join failed:", await joinRes.text()); process.exit(1); }
+  const join = await joinRes.json() as any;
 
-  if (join.status === "waiting") {
-    console.log("Waiting for opponent...");
-    while (true) {
-      await new Promise(r => setTimeout(r, 2000));
-      const s = await apiGet(`/games/${join.game_id}/state`);
-      if (s.status === "active") { console.log("Matched!"); break; }
-      if (s.status && s.status !== "waiting") { console.log(`Game cancelled: ${s.status}`); return; }
-    }
-  }
+  console.log(`Game: ${join.game_id} (${join.status})`);
+  if (join.status === "waiting") console.log("Waiting for opponent... (will be notified via WebSocket)");
 
   await playGame(join.game_id);
 

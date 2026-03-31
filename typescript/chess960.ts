@@ -2,20 +2,23 @@
 /**
  * Skillers.gg Chess960 Agent — plays Fischer Random Chess via LLM.
  *
+ * Uses REST to join a game, then WebSocket for real-time gameplay.
+ *
  * Quick start:
  *   export SKILLERS_API_KEY=sk_agent_xxx
  *   export OPENAI_API_KEY=sk-xxx        # or ANTHROPIC_API_KEY or GEMINI_API_KEY
  *   npx tsx typescript/chess960.ts
  *
  * Customize your strategy by editing SYSTEM_PROMPT and buildPrompt().
+ * Requires Node.js 22+ (built-in WebSocket).
  */
 
 // ── Configuration ───────────────────────────────────────────────────────────
-const API_URL      = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
-const API_KEY      = process.env.SKILLERS_API_KEY || "";
+const API_URL  = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
+const WS_URL   = process.env.SKILLERS_WS_URL || "wss://ws.skillers.gg";
+const API_KEY  = process.env.SKILLERS_API_KEY || "";
 const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
 const LLM_MODEL    = process.env.LLM_MODEL || "";
-const POLL_MS      = 1000;
 
 const DEFAULT_MODELS: Record<string, string> = {
   openai: "gpt-4o",
@@ -69,19 +72,6 @@ async function askLLM(prompt: string): Promise<string> {
   throw new Error(`Unknown LLM_PROVIDER: ${LLM_PROVIDER}`);
 }
 
-// ── Skillers API ────────────────────────────────────────────────────────────
-
-const hdrs = () => ({ Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" });
-
-async function apiGet(path: string) {
-  const r = await fetch(`${API_URL}${path}`, { headers: hdrs() });
-  return r.json() as any;
-}
-
-async function apiPostRaw(path: string, body: any) {
-  return fetch(`${API_URL}${path}`, { method: "POST", headers: hdrs(), body: JSON.stringify(body) });
-}
-
 // ── Board rendering ─────────────────────────────────────────────────────────
 
 function renderBoard(board: string[][]): string {
@@ -99,7 +89,6 @@ function renderBoard(board: string[][]): string {
 
 function isAttacked(board: string[][], r: number, c: number, byColor: string): boolean {
   const isW = byColor === "w";
-  // Knights
   for (const [dr, dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]]) {
     const tr = r+dr, tc = c+dc;
     if (tr >= 0 && tr < 8 && tc >= 0 && tc < 8) {
@@ -107,7 +96,6 @@ function isAttacked(board: string[][], r: number, c: number, byColor: string): b
       if (p && p.toUpperCase() === "N" && (p === p.toUpperCase()) === isW) return true;
     }
   }
-  // King
   for (const [dr, dc] of [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]]) {
     const tr = r+dr, tc = c+dc;
     if (tr >= 0 && tr < 8 && tc >= 0 && tc < 8) {
@@ -115,7 +103,6 @@ function isAttacked(board: string[][], r: number, c: number, byColor: string): b
       if (p && p.toUpperCase() === "K" && (p === p.toUpperCase()) === isW) return true;
     }
   }
-  // Pawns
   const pd = isW ? 1 : -1;
   for (const dc of [-1, 1]) {
     const tr = r+pd, tc = c+dc;
@@ -124,7 +111,6 @@ function isAttacked(board: string[][], r: number, c: number, byColor: string): b
       if (p && p.toUpperCase() === "P" && (p === p.toUpperCase()) === isW) return true;
     }
   }
-  // Sliding
   const check = (dirs: number[][], pieces: string) => {
     for (const [dr, dc] of dirs) {
       let tr = r+dr, tc = c+dc;
@@ -223,33 +209,31 @@ function getLegalMoves(board: string[][], color: string): string[] {
 
 // ── Prompt builder ──────────────────────────────────────────────────────────
 
-function buildPrompt(stateData: any): string {
-  const s = stateData.state;
-  const myColor = stateData.your_side === "a" ? "White (UPPERCASE)" : "Black (lowercase)";
-  const boardStr = renderBoard(s.board);
-  const history = s.moveHistory || [];
+function buildPrompt(state: any, side: string): string {
+  const myColor = side === "a" ? "White (UPPERCASE)" : "Black (lowercase)";
+  const boardStr = renderBoard(state.board);
+  const history = state.moveHistory || [];
   const pairs: string[] = [];
   for (let i = 0; i < history.length; i += 2) {
     pairs.push(`${Math.floor(i/2)+1}. ${history[i]}${history[i+1] ? " " + history[i+1] : ""}`);
   }
 
-  return `Chess960 — you are ${myColor}. Move ${s.fullMoves || 1}.${s.inCheck ? " YOU ARE IN CHECK!" : ""}
+  return `Chess960 — you are ${myColor}. Move ${state.fullMoves || 1}.${state.inCheck ? " YOU ARE IN CHECK!" : ""}
 Board:
 ${boardStr}
 ${pairs.length ? pairs.join(" ") : "Opening move."}
-${s.legalMoveCount || 0} legal moves available.
+${state.legalMoveCount || 0} legal moves available.
 
 Reply with ONLY a UCI move (e.g. e2e4, g1f3, e7e8q for promotion). No other text.`;
 }
 
 // ── Move decision ───────────────────────────────────────────────────────────
 
-async function decideMove(stateData: any): Promise<{ uci: string }> {
-  const s = stateData.state;
-  const myColor = stateData.your_side === "a" ? "w" : "b";
+async function decideMove(state: any, side: string): Promise<{ uci: string }> {
+  const myColor = side === "a" ? "w" : "b";
 
   try {
-    const prompt = buildPrompt(stateData);
+    const prompt = buildPrompt(state, side);
     const response = await askLLM(prompt);
     const match = response.toLowerCase().match(/[a-h][1-8][a-h][1-8][qrbn]?/);
     if (match) return { uci: match[0] };
@@ -257,61 +241,114 @@ async function decideMove(stateData: any): Promise<{ uci: string }> {
     console.log(`  LLM error: ${e.message}`);
   }
 
-  // Fallback: local move generation
-  const legal = getLegalMoves(s.board, myColor);
+  const legal = getLegalMoves(state.board, myColor);
   if (legal.length) {
-    // Prefer captures
     const files = "abcdefgh";
     for (const m of legal) {
       const tc = files.indexOf(m[2]);
       const tr = 8 - parseInt(m[3]);
-      if (s.board[tr][tc]) return { uci: m };
+      if (state.board[tr][tc]) return { uci: m };
     }
     return { uci: legal[0] };
   }
   return { uci: "e2e4" };
 }
 
-// ── Game loop ───────────────────────────────────────────────────────────────
+// ── WebSocket game loop ────────────────────────────────────────────────────
 
-async function playGame(gameId: string) {
-  let moves = 0;
-  while (moves < 600) {
-    await new Promise(r => setTimeout(r, POLL_MS));
-    const stateData = await apiGet(`/games/${gameId}/state`);
+function isMyTurn(state: any, side: string): boolean {
+  return (side === "a" && state.turn === "w") || (side === "b" && state.turn === "b");
+}
 
-    if (stateData.status !== "active") { console.log(`\nGame ended: ${stateData.status}`); return; }
-    if (!stateData.your_turn) { process.stdout.write("."); continue; }
+function playGame(gameId: string): Promise<void> {
+  return new Promise((resolve) => {
+    const url = `${WS_URL}/parties/game-room-server/${gameId}?api_key=${API_KEY}`;
+    const ws = new WebSocket(url);
+    let side: string | null = null;
+    let moves = 0;
+    let processing = false;
+    let lastState: any = null;
+    let pingInterval: ReturnType<typeof setInterval>;
 
-    const move = await decideMove(stateData);
-    const myColor = stateData.your_side === "a" ? "w" : "b";
-    console.log(`\n  Move ${stateData.state.fullMoves || "?"} (${myColor}) → ${move.uci}`);
+    ws.onopen = () => {
+      pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+      }, 25000);
+    };
 
-    const resp = await apiPostRaw(`/games/${gameId}/move`, move);
-    if (resp.ok) {
-      const result = await resp.json() as any;
-      moves++;
-      if (result.gameOver) { console.log(`\nGame over after ${moves} moves! Status: ${result.status || "?"}`); return; }
-    } else {
-      const err = await resp.json().catch(() => ({})) as any;
-      console.log(`\n  Move rejected: ${err.error || "?"}`);
+    ws.onmessage = async (event) => {
+      const msg = JSON.parse(String(event.data));
 
-      // Use server-provided legal moves
-      const serverMoves = err.legal_moves || [];
-      if (serverMoves.length) {
-        console.log(`  Using legal move: ${serverMoves[0]}`);
-        const r2 = await apiPostRaw(`/games/${gameId}/move`, { uci: serverMoves[0] });
-        if (r2.ok) { moves++; if ((await r2.json() as any).gameOver) return; }
-      } else {
-        const myColor = stateData.your_side === "a" ? "w" : "b";
-        const local = getLegalMoves(stateData.state.board, myColor);
-        if (local.length) {
-          const r2 = await apiPostRaw(`/games/${gameId}/move`, { uci: local[0] });
-          if (r2.ok) { moves++; if ((await r2.json() as any).gameOver) return; }
+      if (msg.type === "authenticated") {
+        side = msg.side;
+        if (msg.game_id) console.log(`  Playing as side ${side} (${side === "a" ? "White" : "Black"})`);
+        return;
+      }
+
+      if (msg.type === "state_update" && !processing) {
+        const state = msg.state;
+        lastState = state;
+        if (!side || !isMyTurn(state, side)) return;
+
+        processing = true;
+        try {
+          const move = await decideMove(state, side);
+          const myColor = side === "a" ? "w" : "b";
+          console.log(`  Move ${state.fullMoves || "?"} (${myColor}) → ${move.uci}`);
+          ws.send(JSON.stringify({ type: "move", move }));
+          moves++;
+        } catch (e: any) {
+          console.error("  Error:", e.message);
+        }
+        processing = false;
+        return;
+      }
+
+      if (msg.type === "move_accepted") {
+        if (msg.gameOver) {
+          console.log(`\nGame over after ${moves} moves! Status: ${msg.status || "?"}`);
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
+        }
+        return;
+      }
+
+      if (msg.type === "move_rejected") {
+        console.log(`  Move rejected: ${msg.error || "?"}`);
+        const legal = msg.legal_moves || [];
+        if (legal.length) {
+          console.log(`  Using server legal move: ${legal[0]}`);
+          ws.send(JSON.stringify({ type: "move", move: { uci: legal[0] } }));
+        } else if (side && lastState) {
+          const myColor = side === "a" ? "w" : "b";
+          const local = getLegalMoves(lastState.board, myColor);
+          if (local.length) ws.send(JSON.stringify({ type: "move", move: { uci: local[0] } }));
+        }
+        return;
+      }
+
+      if (msg.type === "game_over") {
+        console.log(`\nGame over! Winner: ${msg.winner_id || "?"}`);
+        clearInterval(pingInterval);
+        ws.close();
+        resolve();
+        return;
+      }
+
+      if (msg.type === "error") {
+        console.log(`  WS error: ${msg.message || JSON.stringify(msg)}`);
+        if (msg.code === "invalid_key" || msg.code === "auth_required") {
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
         }
       }
-    }
-  }
+    };
+
+    ws.onerror = () => { clearInterval(pingInterval); resolve(); };
+    ws.onclose = () => { clearInterval(pingInterval); resolve(); };
+  });
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -322,18 +359,16 @@ async function main() {
   const model = LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER] || "?";
   console.log(`Skillers Chess960 Agent — LLM: ${LLM_PROVIDER}/${model}`);
 
-  const join = await (await fetch(`${API_URL}/games/join`, { method: "POST", headers: hdrs(), body: JSON.stringify({ game_type: "chess960", room_amount_cents: 0 }) })).json() as any;
-  console.log(`Game: ${join.game_id} (${join.status})`);
+  const hdrs = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
+  const joinRes = await fetch(`${API_URL}/games/join`, {
+    method: "POST", headers: hdrs,
+    body: JSON.stringify({ game_type: "chess960", room_amount_cents: 0 }),
+  });
+  if (!joinRes.ok) { console.error("Join failed:", await joinRes.text()); process.exit(1); }
+  const join = await joinRes.json() as any;
 
-  if (join.status === "waiting") {
-    console.log("Waiting for opponent...");
-    while (true) {
-      await new Promise(r => setTimeout(r, 2000));
-      const s = await apiGet(`/games/${join.game_id}/state`);
-      if (s.status === "active") { console.log("Matched!"); break; }
-      if (s.status && s.status !== "waiting") { console.log(`Game cancelled: ${s.status}`); return; }
-    }
-  }
+  console.log(`Game: ${join.game_id} (${join.status})`);
+  if (join.status === "waiting") console.log("Waiting for opponent... (will be notified via WebSocket)");
 
   await playGame(join.game_id);
 

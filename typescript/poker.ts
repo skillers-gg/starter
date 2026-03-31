@@ -2,20 +2,23 @@
 /**
  * Skillers.gg Poker Agent — plays Heads-Up No-Limit Texas Hold'em via LLM.
  *
+ * Uses REST to join a game, then WebSocket for real-time gameplay.
+ *
  * Quick start:
  *   export SKILLERS_API_KEY=sk_agent_xxx
  *   export OPENAI_API_KEY=sk-xxx        # or ANTHROPIC_API_KEY or GEMINI_API_KEY
  *   npx tsx typescript/poker.ts
  *
  * Customize your strategy by editing SYSTEM_PROMPT and buildPrompt().
+ * Requires Node.js 22+ (built-in WebSocket).
  */
 
 // ── Configuration ───────────────────────────────────────────────────────────
-const API_URL      = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
-const API_KEY      = process.env.SKILLERS_API_KEY || "";
-const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";    // "openai", "anthropic", "gemini"
+const API_URL  = process.env.SKILLERS_API_URL || "https://skillers.gg/api";
+const WS_URL   = process.env.SKILLERS_WS_URL || "wss://ws.skillers.gg";
+const API_KEY  = process.env.SKILLERS_API_KEY || "";
+const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
 const LLM_MODEL    = process.env.LLM_MODEL || "";
-const POLL_MS      = 1000;
 
 const DEFAULT_MODELS: Record<string, string> = {
   openai: "gpt-4o",
@@ -42,8 +45,7 @@ async function askLLM(prompt: string): Promise<string> {
       body: JSON.stringify({ model, max_tokens: 256, temperature: 0.3,
         messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }] }),
     });
-    const data = await res.json() as any;
-    return data.choices[0].message.content.trim();
+    return ((await res.json()) as any).choices[0].message.content.trim();
   }
 
   if (LLM_PROVIDER === "anthropic") {
@@ -54,8 +56,7 @@ async function askLLM(prompt: string): Promise<string> {
       body: JSON.stringify({ model, max_tokens: 256, system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: prompt }] }),
     });
-    const data = await res.json() as any;
-    return data.content[0].text.trim();
+    return ((await res.json()) as any).content[0].text.trim();
   }
 
   if (LLM_PROVIDER === "gemini") {
@@ -66,8 +67,7 @@ async function askLLM(prompt: string): Promise<string> {
         body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 256, temperature: 0.3 } }) });
-    const data = await res.json() as any;
-    return data.candidates[0].content.parts[0].text.trim();
+    return ((await res.json()) as any).candidates[0].content.parts[0].text.trim();
   }
 
   throw new Error(`Unknown LLM_PROVIDER: ${LLM_PROVIDER}`);
@@ -80,46 +80,25 @@ function parseJSON(text: string): any | null {
   return null;
 }
 
-// ── Skillers API ────────────────────────────────────────────────────────────
-
-const headers = () => ({ Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" });
-
-async function apiGet(path: string) {
-  const r = await fetch(`${API_URL}${path}`, { headers: headers() });
-  return r.json() as any;
-}
-
-async function apiPost(path: string, body: any) {
-  const r = await fetch(`${API_URL}${path}`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
-  if (!r.ok) { const err = await r.json().catch(() => ({})) as any; throw Object.assign(new Error(err.error || r.statusText), { body: err }); }
-  return r.json() as any;
-}
-
-async function apiPostRaw(path: string, body: any) {
-  return fetch(`${API_URL}${path}`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
-}
-
 // ── Prompt builder ──────────────────────────────────────────────────────────
 
-function buildPrompt(stateData: any): string {
-  const s = stateData.state;
-  const side = stateData.your_side;
-  const myStack  = side === "a" ? s.stackA : s.stackB;
-  const oppStack = side === "a" ? s.stackB : s.stackA;
-  const myBet    = side === "a" ? (s.currentBetA || 0) : (s.currentBetB || 0);
-  const oppBet   = side === "a" ? (s.currentBetB || 0) : (s.currentBetA || 0);
+function buildPrompt(state: any, side: string): string {
+  const myStack  = side === "a" ? state.stackA : state.stackB;
+  const oppStack = side === "a" ? state.stackB : state.stackA;
+  const myBet    = side === "a" ? (state.currentBetA || 0) : (state.currentBetB || 0);
+  const oppBet   = side === "a" ? (state.currentBetB || 0) : (state.currentBetA || 0);
   const toCall   = oppBet - myBet;
-  const isDealer = s.dealer === side;
+  const isDealer = state.dealer === side;
 
-  const history = (s.bettingHistory || []).slice(-8)
+  const history = (state.bettingHistory || []).slice(-8)
     .map((h: any) => `${h.side}:${h.action}${h.amount ? `(${h.amount})` : ""}`)
     .join(" ") || "none";
 
-  return `Heads-Up No-Limit Hold'em — Hand #${s.handNumber || 1}, Stage: ${s.stage || "?"}
+  return `Heads-Up No-Limit Hold'em — Hand #${state.handNumber || 1}, Stage: ${state.stage || "?"}
 Position: ${isDealer ? "Dealer/SB" : "Big Blind"}
-Hole cards: ${(s.holeCards || []).join(" ")}
-Community:  ${(s.community || []).join(" ") || "(none)"}
-Pot: ${s.pot || 0} | Your stack: ${myStack} | Opponent stack: ${oppStack}
+Hole cards: ${(state.holeCards || []).join(" ")}
+Community:  ${(state.community || []).join(" ") || "(none)"}
+Pot: ${state.pot || 0} | Your stack: ${myStack} | Opponent stack: ${oppStack}
 To call: ${toCall > 0 ? toCall : "0 (no bet to match)"}
 Recent actions: ${history}
 
@@ -132,15 +111,13 @@ Respond with ONLY one JSON object:
 
 // ── Move decision ───────────────────────────────────────────────────────────
 
-async function decideMove(stateData: any): Promise<any> {
-  const s = stateData.state;
-  const side = stateData.your_side;
-  const myBet  = side === "a" ? (s.currentBetA || 0) : (s.currentBetB || 0);
-  const oppBet = side === "a" ? (s.currentBetB || 0) : (s.currentBetA || 0);
+async function decideMove(state: any, side: string): Promise<any> {
+  const myBet  = side === "a" ? (state.currentBetA || 0) : (state.currentBetB || 0);
+  const oppBet = side === "a" ? (state.currentBetB || 0) : (state.currentBetA || 0);
   const toCall = oppBet - myBet;
 
   try {
-    const prompt = buildPrompt(stateData);
+    const prompt = buildPrompt(state, side);
     const response = await askLLM(prompt);
     const move = parseJSON(response);
     if (move?.action) {
@@ -154,40 +131,94 @@ async function decideMove(stateData: any): Promise<any> {
   return toCall > 0 ? { action: "call" } : { action: "check" };
 }
 
-// ── Game loop ───────────────────────────────────────────────────────────────
+// ── WebSocket game loop ────────────────────────────────────────────────────
 
-async function playGame(gameId: string) {
-  let moves = 0;
-  while (moves < 500) {
-    await new Promise(r => setTimeout(r, POLL_MS));
-    const stateData = await apiGet(`/games/${gameId}/state`);
+function playGame(gameId: string): Promise<void> {
+  return new Promise((resolve) => {
+    const url = `${WS_URL}/parties/game-room-server/${gameId}?api_key=${API_KEY}`;
+    const ws = new WebSocket(url);
+    let side: string | null = null;
+    let moves = 0;
+    let processing = false;
+    let lastState: any = null;
+    let pingInterval: ReturnType<typeof setInterval>;
 
-    if (stateData.status !== "active") {
-      console.log(`\nGame ended: ${stateData.status}`);
-      return;
-    }
-    if (!stateData.your_turn) { process.stdout.write("."); continue; }
+    ws.onopen = () => {
+      pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+      }, 25000);
+    };
 
-    const move = await decideMove(stateData);
-    const s = stateData.state;
-    console.log(`\n  Hand ${s.handNumber || "?"} [${s.stage || "?"}] Cards: ${(s.holeCards||[]).join(" ")} Board: ${(s.community||[]).join(" ")} → ${JSON.stringify(move)}`);
+    ws.onmessage = async (event) => {
+      const msg = JSON.parse(String(event.data));
 
-    try {
-      const result = await apiPost(`/games/${gameId}/move`, move);
-      moves++;
-      if (result.gameOver) { console.log(`\nGame over after ${moves} moves! Winner: ${result.winner_agent_id || "draw"}`); return; }
-    } catch (e: any) {
-      console.log(`\n  Move rejected: ${e.body?.error || e.message}`);
-      for (const fallback of [{ action: "call" }, { action: "check" }, { action: "fold" }]) {
-        try {
-          const result = await apiPost(`/games/${gameId}/move`, fallback);
-          moves++;
-          if (result.gameOver) return;
-          break;
-        } catch { continue; }
+      if (msg.type === "authenticated") {
+        side = msg.side;
+        if (msg.game_id) console.log(`  Playing as side ${side}`);
+        return;
       }
-    }
-  }
+
+      if (msg.type === "state_update" && !processing) {
+        const state = msg.state;
+        lastState = state;
+        if (!side || state.toAct !== side) return;
+
+        processing = true;
+        try {
+          const move = await decideMove(state, side);
+          const s = state;
+          console.log(`  Hand ${s.handNumber || "?"} [${s.stage || "?"}] Cards: ${(s.holeCards||[]).join(" ")} Board: ${(s.community||[]).join(" ")} → ${JSON.stringify(move)}`);
+          ws.send(JSON.stringify({ type: "move", move }));
+          moves++;
+        } catch (e: any) {
+          console.error("  Error:", e.message);
+        }
+        processing = false;
+        return;
+      }
+
+      if (msg.type === "move_accepted") {
+        if (msg.gameOver) {
+          console.log(`\nGame over after ${moves} moves! Winner: ${msg.winner_agent_id || "draw"}`);
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
+        }
+        return;
+      }
+
+      if (msg.type === "move_rejected") {
+        console.log(`  Move rejected: ${msg.error || "?"}`);
+        if (side && lastState) {
+          const myBet  = side === "a" ? (lastState.currentBetA || 0) : (lastState.currentBetB || 0);
+          const oppBet = side === "a" ? (lastState.currentBetB || 0) : (lastState.currentBetA || 0);
+          const fallback = oppBet > myBet ? { action: "call" } : { action: "check" };
+          ws.send(JSON.stringify({ type: "move", move: fallback }));
+        }
+        return;
+      }
+
+      if (msg.type === "game_over") {
+        console.log(`\nGame over! Winner: ${msg.winner_id || "?"}`);
+        clearInterval(pingInterval);
+        ws.close();
+        resolve();
+        return;
+      }
+
+      if (msg.type === "error") {
+        console.log(`  WS error: ${msg.message || JSON.stringify(msg)}`);
+        if (msg.code === "invalid_key" || msg.code === "auth_required") {
+          clearInterval(pingInterval);
+          ws.close();
+          resolve();
+        }
+      }
+    };
+
+    ws.onerror = () => { clearInterval(pingInterval); resolve(); };
+    ws.onclose = () => { clearInterval(pingInterval); resolve(); };
+  });
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -198,18 +229,16 @@ async function main() {
   const model = LLM_MODEL || DEFAULT_MODELS[LLM_PROVIDER] || "?";
   console.log(`Skillers Poker Agent — LLM: ${LLM_PROVIDER}/${model}`);
 
-  const join = await apiPost("/games/join", { game_type: "poker", room_amount_cents: 0 });
-  console.log(`Game: ${join.game_id} (${join.status})`);
+  const hdrs = { Authorization: `Bearer ${API_KEY}`, "Content-Type": "application/json" };
+  const joinRes = await fetch(`${API_URL}/games/join`, {
+    method: "POST", headers: hdrs,
+    body: JSON.stringify({ game_type: "poker", room_amount_cents: 0 }),
+  });
+  if (!joinRes.ok) { console.error("Join failed:", await joinRes.text()); process.exit(1); }
+  const join = await joinRes.json() as any;
 
-  if (join.status === "waiting") {
-    console.log("Waiting for opponent...");
-    while (true) {
-      await new Promise(r => setTimeout(r, 2000));
-      const s = await apiGet(`/games/${join.game_id}/state`);
-      if (s.status === "active") { console.log("Matched!"); break; }
-      if (s.status && s.status !== "waiting") { console.log(`Game cancelled: ${s.status}`); return; }
-    }
-  }
+  console.log(`Game: ${join.game_id} (${join.status})`);
+  if (join.status === "waiting") console.log("Waiting for opponent... (will be notified via WebSocket)");
 
   await playGame(join.game_id);
 

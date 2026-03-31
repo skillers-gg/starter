@@ -2,6 +2,8 @@
 """
 Skillers.gg Poker Agent — plays Heads-Up No-Limit Texas Hold'em via LLM.
 
+Uses REST to join a game, then WebSocket for real-time gameplay.
+
 Quick start:
   export SKILLERS_API_KEY=sk_agent_xxx
   export OPENAI_API_KEY=sk-xxx        # or ANTHROPIC_API_KEY or GEMINI_API_KEY
@@ -10,16 +12,16 @@ Quick start:
 Customize your strategy by editing the SYSTEM_PROMPT and build_prompt() function.
 """
 
-import os, sys, time, json, re, requests
+import os, sys, json, re, requests
+import websockets.sync.client
 
 # ── Configuration ────────────────────────────────────────────────────────────
-API_URL       = os.environ.get("SKILLERS_API_URL", "https://skillers.gg/api")
-API_KEY       = os.environ.get("SKILLERS_API_KEY", "")
-LLM_PROVIDER  = os.environ.get("LLM_PROVIDER", "openai")     # "openai", "anthropic", or "gemini"
-LLM_MODEL     = os.environ.get("LLM_MODEL", "")               # defaults per provider below
-POLL_INTERVAL = 1  # seconds between state polls
+API_URL  = os.environ.get("SKILLERS_API_URL", "https://skillers.gg/api")
+WS_URL   = os.environ.get("SKILLERS_WS_URL", "wss://ws.skillers.gg")
+API_KEY  = os.environ.get("SKILLERS_API_KEY", "")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")     # "openai", "anthropic", or "gemini"
+LLM_MODEL    = os.environ.get("LLM_MODEL", "")               # defaults per provider below
 
-# Default models per provider
 DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "anthropic": "claude-sonnet-4-20250514",
@@ -83,43 +85,28 @@ def parse_json(text: str) -> dict | None:
             pass
     return None
 
-# ── Skillers API ─────────────────────────────────────────────────────────────
-
-def api_get(path: str) -> dict:
-    r = requests.get(f"{API_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}"})
-    r.raise_for_status()
-    return r.json()
-
-def api_post(path: str, body: dict) -> dict:
-    r = requests.post(f"{API_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}",
-                       "Content-Type": "application/json"}, json=body)
-    r.raise_for_status()
-    return r.json()
-
 # ── Game-specific prompt builder ─────────────────────────────────────────────
 
-def build_prompt(state_data: dict) -> str:
+def build_prompt(state: dict, side: str) -> str:
     """Build the prompt sent to your LLM each turn. Edit this to improve play."""
-    s = state_data["state"]
-    side = state_data["your_side"]
-    my_stack  = s["stackA"] if side == "a" else s["stackB"]
-    opp_stack = s["stackB"] if side == "a" else s["stackA"]
-    my_bet    = s.get("currentBetA", 0) if side == "a" else s.get("currentBetB", 0)
-    opp_bet   = s.get("currentBetB", 0) if side == "a" else s.get("currentBetA", 0)
+    my_stack  = state["stackA"] if side == "a" else state["stackB"]
+    opp_stack = state["stackB"] if side == "a" else state["stackA"]
+    my_bet    = state.get("currentBetA", 0) if side == "a" else state.get("currentBetB", 0)
+    opp_bet   = state.get("currentBetB", 0) if side == "a" else state.get("currentBetA", 0)
     to_call   = opp_bet - my_bet
-    is_dealer = s.get("dealer") == side
+    is_dealer = state.get("dealer") == side
 
-    history = s.get("bettingHistory", [])
+    history = state.get("bettingHistory", [])
     history_str = " ".join(
         f"{h['side']}:{h['action']}" + (f"({h['amount']})" if h.get('amount') else "")
         for h in history[-8:]
     ) if history else "none"
 
-    return f"""Heads-Up No-Limit Hold'em — Hand #{s.get('handNumber', 1)}, Stage: {s.get('stage', '?')}
+    return f"""Heads-Up No-Limit Hold'em — Hand #{state.get('handNumber', 1)}, Stage: {state.get('stage', '?')}
 Position: {"Dealer/SB" if is_dealer else "Big Blind"}
-Hole cards: {' '.join(s.get('holeCards', []))}
-Community:  {' '.join(s.get('community', [])) or '(none)'}
-Pot: {s.get('pot', 0)} | Your stack: {my_stack} | Opponent stack: {opp_stack}
+Hole cards: {' '.join(state.get('holeCards', []))}
+Community:  {' '.join(state.get('community', [])) or '(none)'}
+Pot: {state.get('pot', 0)} | Your stack: {my_stack} | Opponent stack: {opp_stack}
 To call: {to_call if to_call > 0 else '0 (no bet to match)'}
 Recent actions: {history_str}
 
@@ -131,16 +118,14 @@ Respond with ONLY one JSON object:
 
 # ── Move decision ────────────────────────────────────────────────────────────
 
-def decide_move(state_data: dict) -> dict:
+def decide_move(state: dict, side: str) -> dict:
     """Ask the LLM for a poker move. Fallback to check/call on failure."""
-    s = state_data["state"]
-    side = state_data["your_side"]
-    my_bet  = s.get("currentBetA", 0) if side == "a" else s.get("currentBetB", 0)
-    opp_bet = s.get("currentBetB", 0) if side == "a" else s.get("currentBetA", 0)
+    my_bet  = state.get("currentBetA", 0) if side == "a" else state.get("currentBetB", 0)
+    opp_bet = state.get("currentBetB", 0) if side == "a" else state.get("currentBetA", 0)
     to_call = opp_bet - my_bet
 
     try:
-        prompt = build_prompt(state_data)
+        prompt = build_prompt(state, side)
         response = ask_llm(prompt)
         move = parse_json(response)
         if move and "action" in move:
@@ -150,56 +135,74 @@ def decide_move(state_data: dict) -> dict:
     except Exception as e:
         print(f"  LLM error: {e}")
 
-    # Fallback: call if there's a bet, otherwise check
     return {"action": "call"} if to_call > 0 else {"action": "check"}
 
-# ── Game loop ────────────────────────────────────────────────────────────────
+# ── WebSocket game loop ─────────────────────────────────────────────────────
 
 def play_game(game_id: str):
-    """Play a full poker game by polling state and submitting moves."""
-    moves = 0
-    while moves < 500:
-        time.sleep(POLL_INTERVAL)
-        state_data = api_get(f"/games/{game_id}/state")
-        status = state_data.get("status", "")
+    """Play a full poker game over WebSocket."""
+    url = f"{WS_URL}/parties/game-room-server/{game_id}?api_key={API_KEY}"
+    with websockets.sync.client.connect(url, close_timeout=5) as ws:
+        side = None
+        moves = 0
+        last_state = None
 
-        if status != "active":
-            print(f"\nGame ended: {status}")
-            return
+        while moves < 500:
+            try:
+                raw = ws.recv(timeout=30)
+            except TimeoutError:
+                ws.send(json.dumps({"type": "ping"}))
+                continue
 
-        if not state_data.get("your_turn"):
-            sys.stdout.write(".")
-            sys.stdout.flush()
-            continue
+            msg = json.loads(raw)
 
-        move = decide_move(state_data)
-        s = state_data["state"]
-        print(f"\n  Hand {s.get('handNumber','?')} [{s.get('stage','?')}] "
-              f"Cards: {s.get('holeCards',[])} Board: {s.get('community',[])} → {move}")
+            if msg["type"] == "authenticated":
+                side = msg.get("side")
+                if msg.get("game_id"):
+                    print(f"  Playing as side {side}")
+                continue
 
-        try:
-            result = api_post(f"/games/{game_id}/move", move)
-            moves += 1
-            if result.get("gameOver"):
-                winner = result.get("winner_agent_id", "draw")
-                print(f"\nGame over after {moves} moves! Winner: {winner}")
-                return
-        except requests.HTTPError as e:
-            err = e.response.json() if e.response.headers.get("content-type","").startswith("application/json") else {}
-            print(f"\n  Move rejected: {err.get('error', e.response.text)}")
-            # Fallback: try call, then check, then fold
-            for fallback in [{"action": "call"}, {"action": "check"}, {"action": "fold"}]:
-                try:
-                    result = api_post(f"/games/{game_id}/move", fallback)
-                    moves += 1
-                    if result.get("gameOver"):
-                        print(f"\nGame over after {moves} moves!")
-                        return
-                    break
-                except:
+            if msg["type"] == "state_update":
+                state = msg.get("state", {})
+                last_state = state
+                if not side or state.get("toAct") != side:
                     continue
 
-    print(f"\nReached {moves} moves limit.")
+                move = decide_move(state, side)
+                s = state
+                print(f"  Hand {s.get('handNumber','?')} [{s.get('stage','?')}] "
+                      f"Cards: {s.get('holeCards',[])} Board: {s.get('community',[])} → {move}")
+                ws.send(json.dumps({"type": "move", "move": move}))
+                moves += 1
+                continue
+
+            if msg["type"] == "move_accepted":
+                if msg.get("gameOver"):
+                    winner = msg.get("winner_agent_id", "draw")
+                    print(f"\nGame over after {moves} moves! Winner: {winner}")
+                    return
+                continue
+
+            if msg["type"] == "move_rejected":
+                print(f"  Move rejected: {msg.get('error', '?')}")
+                if side and last_state:
+                    my_bet  = last_state.get("currentBetA", 0) if side == "a" else last_state.get("currentBetB", 0)
+                    opp_bet = last_state.get("currentBetB", 0) if side == "a" else last_state.get("currentBetA", 0)
+                    fallback = {"action": "call"} if opp_bet > my_bet else {"action": "check"}
+                    ws.send(json.dumps({"type": "move", "move": fallback}))
+                continue
+
+            if msg["type"] == "game_over":
+                print(f"\nGame over! Winner: {msg.get('winner_id', '?')}")
+                return
+
+            if msg["type"] == "error":
+                print(f"  WS error: {msg.get('message', msg)}")
+                if msg.get("code") in ("invalid_key", "auth_required"):
+                    return
+                continue
+
+        print(f"\nReached {moves} moves limit.")
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -212,21 +215,17 @@ def main():
     print(f"Skillers Poker Agent — LLM: {LLM_PROVIDER}/{model}")
     print(f"Joining poker game...")
 
-    join = api_post("/games/join", {"game_type": "poker", "room_amount_cents": 0})
+    r = requests.post(f"{API_URL}/games/join",
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        json={"game_type": "poker", "room_amount_cents": 0})
+    r.raise_for_status()
+    join = r.json()
+
     game_id = join["game_id"]
     print(f"Game: {game_id} ({join['status']})")
 
     if join["status"] == "waiting":
-        print("Waiting for opponent...")
-        while True:
-            time.sleep(2)
-            s = api_get(f"/games/{game_id}/state")
-            if s.get("status") == "active":
-                print("Matched!")
-                break
-            if s.get("status") not in ("active", "waiting", None):
-                print(f"Game cancelled: {s.get('status')}")
-                return
+        print("Waiting for opponent... (will be notified via WebSocket)")
 
     play_game(game_id)
 

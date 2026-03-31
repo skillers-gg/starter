@@ -2,6 +2,8 @@
 """
 Skillers.gg Chess960 Agent — plays Fischer Random Chess via LLM.
 
+Uses REST to join a game, then WebSocket for real-time gameplay.
+
 Quick start:
   export SKILLERS_API_KEY=sk_agent_xxx
   export OPENAI_API_KEY=sk-xxx        # or ANTHROPIC_API_KEY or GEMINI_API_KEY
@@ -10,14 +12,15 @@ Quick start:
 Customize your strategy by editing the SYSTEM_PROMPT and build_prompt() function.
 """
 
-import os, sys, time, json, re, requests
+import os, sys, json, re, requests
+import websockets.sync.client
 
 # ── Configuration ────────────────────────────────────────────────────────────
-API_URL       = os.environ.get("SKILLERS_API_URL", "https://skillers.gg/api")
-API_KEY       = os.environ.get("SKILLERS_API_KEY", "")
-LLM_PROVIDER  = os.environ.get("LLM_PROVIDER", "openai")
-LLM_MODEL     = os.environ.get("LLM_MODEL", "")
-POLL_INTERVAL = 1
+API_URL  = os.environ.get("SKILLERS_API_URL", "https://skillers.gg/api")
+WS_URL   = os.environ.get("SKILLERS_WS_URL", "wss://ws.skillers.gg")
+API_KEY  = os.environ.get("SKILLERS_API_KEY", "")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
+LLM_MODEL    = os.environ.get("LLM_MODEL", "")
 
 DEFAULT_MODELS = {
     "openai": "gpt-4o",
@@ -69,24 +72,6 @@ def ask_llm(prompt: str) -> str:
 
     raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-# ── Skillers API ─────────────────────────────────────────────────────────────
-
-def api_get(path: str) -> dict:
-    r = requests.get(f"{API_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}"})
-    r.raise_for_status()
-    return r.json()
-
-def api_post(path: str, body: dict) -> dict:
-    r = requests.post(f"{API_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}",
-                       "Content-Type": "application/json"}, json=body)
-    r.raise_for_status()
-    return r.json()
-
-def api_post_raw(path: str, body: dict) -> requests.Response:
-    """Like api_post but returns raw response (doesn't raise on 400)."""
-    return requests.post(f"{API_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}",
-                          "Content-Type": "application/json"}, json=body)
-
 # ── Board rendering ──────────────────────────────────────────────────────────
 
 def render_board(board: list) -> str:
@@ -122,12 +107,10 @@ def get_legal_moves(board: list, color: str) -> list[str]:
             if pt == "P":
                 d = -1 if is_white else 1
                 start = 6 if is_white else 1
-                # Forward
                 if 0 <= r+d < 8 and not board[r+d][c]:
                     targets.append((r+d, c))
                     if r == start and not board[r+d*2][c]:
                         targets.append((r+d*2, c))
-                # Captures
                 for dc in [-1, 1]:
                     tr, tc = r+d, c+dc
                     if 0 <= tr < 8 and 0 <= tc < 8 and board[tr][tc]:
@@ -172,7 +155,6 @@ def get_legal_moves(board: list, color: str) -> list[str]:
             for tr, tc in targets:
                 pseudo.append(((r, c), (tr, tc)))
 
-    # Filter: moves that leave own king safe
     opp = "b" if is_white else "w"
     king_char = "K" if is_white else "k"
     legal = []
@@ -180,7 +162,6 @@ def get_legal_moves(board: list, color: str) -> list[str]:
         copy = [row[:] for row in board]
         copy[tr][tc] = copy[fr][fc]
         copy[fr][fc] = ""
-        # Find king
         kr, kc = -1, -1
         for rr in range(8):
             for cc in range(8):
@@ -190,7 +171,6 @@ def get_legal_moves(board: list, color: str) -> list[str]:
             continue
         if not is_attacked(copy, kr, kc, opp):
             uci = files[fc] + str(8-fr) + files[tc] + str(8-tr)
-            # Pawn promotion
             promo_rank = 0 if is_white else 7
             if copy[tr][tc].upper() == "P" and tr == promo_rank:
                 uci += "q"
@@ -198,23 +178,19 @@ def get_legal_moves(board: list, color: str) -> list[str]:
     return legal
 
 def is_attacked(board, r, c, by_color):
-    """Check if square (r,c) is attacked by pieces of by_color."""
     is_attacker = by_color == "w"
-    # Knights
     for dr, dc in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]:
         tr, tc = r+dr, c+dc
         if 0 <= tr < 8 and 0 <= tc < 8:
             p = board[tr][tc]
             if p and p.upper() == "N" and (p == p.upper()) == is_attacker:
                 return True
-    # King
     for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
         tr, tc = r+dr, c+dc
         if 0 <= tr < 8 and 0 <= tc < 8:
             p = board[tr][tc]
             if p and p.upper() == "K" and (p == p.upper()) == is_attacker:
                 return True
-    # Pawns
     pawn_dir = 1 if is_attacker else -1
     for dc in [-1, 1]:
         tr, tc = r + pawn_dir, c + dc
@@ -222,7 +198,6 @@ def is_attacked(board, r, c, by_color):
             p = board[tr][tc]
             if p and p.upper() == "P" and (p == p.upper()) == is_attacker:
                 return True
-    # Sliding pieces
     for dirs, pieces in [([(-1,-1),(-1,1),(1,-1),(1,1)], "BQ"),
                          ([(-1,0),(1,0),(0,-1),(0,1)], "RQ")]:
         for dr, dc in dirs:
@@ -239,13 +214,12 @@ def is_attacked(board, r, c, by_color):
 
 # ── Game prompt builder ──────────────────────────────────────────────────────
 
-def build_prompt(state_data: dict) -> str:
+def build_prompt(state: dict, side: str) -> str:
     """Build the chess prompt. Edit this to improve your agent's play."""
-    s = state_data["state"]
-    my_color = "White (UPPERCASE)" if state_data["your_side"] == "a" else "Black (lowercase)"
-    board_str = render_board(s["board"])
+    my_color = "White (UPPERCASE)" if side == "a" else "Black (lowercase)"
+    board_str = render_board(state["board"])
 
-    history = s.get("moveHistory", [])
+    history = state.get("moveHistory", [])
     pairs = []
     for i in range(0, len(history), 2):
         pair = f"{i//2 + 1}. {history[i]}"
@@ -254,23 +228,22 @@ def build_prompt(state_data: dict) -> str:
         pairs.append(pair)
     history_str = " ".join(pairs) if pairs else "Opening move."
 
-    return f"""Chess960 — you are {my_color}. Move {s.get('fullMoves', 1)}.{' YOU ARE IN CHECK!' if s.get('inCheck') else ''}
+    return f"""Chess960 — you are {my_color}. Move {state.get('fullMoves', 1)}.{' YOU ARE IN CHECK!' if state.get('inCheck') else ''}
 Board:
 {board_str}
 {history_str}
-{s.get('legalMoveCount', 0)} legal moves available.
+{state.get('legalMoveCount', 0)} legal moves available.
 
 Reply with ONLY a UCI move (e.g. e2e4, g1f3, e7e8q for promotion). No other text."""
 
 # ── Move decision ────────────────────────────────────────────────────────────
 
-def decide_move(state_data: dict) -> dict:
+def decide_move(state: dict, side: str) -> dict:
     """Ask LLM for a chess move. Falls back to local move generation."""
-    s = state_data["state"]
-    my_color = "w" if state_data["your_side"] == "a" else "b"
+    my_color = "w" if side == "a" else "b"
 
     try:
-        prompt = build_prompt(state_data)
+        prompt = build_prompt(state, side)
         response = ask_llm(prompt)
         uci_match = re.search(r"[a-h][1-8][a-h][1-8][qrbn]?", response.lower())
         if uci_match:
@@ -278,78 +251,91 @@ def decide_move(state_data: dict) -> dict:
     except Exception as e:
         print(f"  LLM error: {e}")
 
-    # Fallback: pick from locally generated legal moves
-    legal = get_legal_moves(s["board"], my_color)
+    legal = get_legal_moves(state["board"], my_color)
     if legal:
-        # Prefer captures (target square occupied)
         files = "abcdefgh"
         for m in legal:
             tc = files.index(m[2])
             tr = 8 - int(m[3])
-            if s["board"][tr][tc]:
+            if state["board"][tr][tc]:
                 return {"uci": m}
         return {"uci": legal[0]}
 
-    return {"uci": "e2e4"}  # last resort — server will provide legal moves on error
+    return {"uci": "e2e4"}
 
-# ── Game loop ────────────────────────────────────────────────────────────────
+# ── WebSocket game loop ─────────────────────────────────────────────────────
+
+def is_my_turn(state: dict, side: str) -> bool:
+    turn = state.get("turn")
+    return (side == "a" and turn == "w") or (side == "b" and turn == "b")
 
 def play_game(game_id: str):
-    moves = 0
-    while moves < 600:
-        time.sleep(POLL_INTERVAL)
-        state_data = api_get(f"/games/{game_id}/state")
-        status = state_data.get("status", "")
+    """Play a full chess960 game over WebSocket."""
+    url = f"{WS_URL}/parties/game-room-server/{game_id}?api_key={API_KEY}"
+    with websockets.sync.client.connect(url, close_timeout=5) as ws:
+        side = None
+        moves = 0
+        last_state = None
 
-        if status != "active":
-            print(f"\nGame ended: {status}")
-            return
+        while moves < 600:
+            try:
+                raw = ws.recv(timeout=30)
+            except TimeoutError:
+                ws.send(json.dumps({"type": "ping"}))
+                continue
 
-        if not state_data.get("your_turn"):
-            sys.stdout.write(".")
-            sys.stdout.flush()
-            continue
+            msg = json.loads(raw)
 
-        move = decide_move(state_data)
-        s = state_data["state"]
-        my_color = "w" if state_data["your_side"] == "a" else "b"
-        print(f"\n  Move {s.get('fullMoves','?')} ({my_color}) → {move['uci']}")
+            if msg["type"] == "authenticated":
+                side = msg.get("side")
+                if msg.get("game_id"):
+                    print(f"  Playing as side {side} ({'White' if side == 'a' else 'Black'})")
+                continue
 
-        resp = api_post_raw(f"/games/{game_id}/move", move)
-        if resp.status_code == 200:
-            result = resp.json()
-            moves += 1
-            if result.get("gameOver"):
-                print(f"\nGame over after {moves} moves! Status: {result.get('status','?')}")
+            if msg["type"] == "state_update":
+                state = msg.get("state", {})
+                last_state = state
+                if not side or not is_my_turn(state, side):
+                    continue
+
+                move = decide_move(state, side)
+                my_color = "w" if side == "a" else "b"
+                print(f"  Move {state.get('fullMoves','?')} ({my_color}) → {move['uci']}")
+                ws.send(json.dumps({"type": "move", "move": move}))
+                moves += 1
+                continue
+
+            if msg["type"] == "move_accepted":
+                if msg.get("gameOver"):
+                    print(f"\nGame over after {moves} moves! Status: {msg.get('status', '?')}")
+                    return
+                continue
+
+            if msg["type"] == "move_rejected":
+                error = msg.get("error", "?")
+                print(f"  Move rejected: {error}")
+                legal = msg.get("legal_moves", [])
+                if legal:
+                    print(f"  Using server legal move: {legal[0]}")
+                    ws.send(json.dumps({"type": "move", "move": {"uci": legal[0]}}))
+                elif side and last_state:
+                    my_color = "w" if side == "a" else "b"
+                    local = get_legal_moves(last_state["board"], my_color)
+                    if local:
+                        ws.send(json.dumps({"type": "move", "move": {"uci": local[0]}}))
+                continue
+
+            if msg["type"] == "game_over":
+                print(f"\nGame over! Winner: {msg.get('winner_id', '?')}")
                 return
-        else:
-            err = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
-            print(f"\n  Move rejected: {err.get('error','?')}")
 
-            # Use server-provided legal moves if available
-            legal = err.get("legal_moves", [])
-            if legal:
-                fallback_uci = legal[0]
-                print(f"  Using legal move: {fallback_uci}")
-                r2 = api_post_raw(f"/games/{game_id}/move", {"uci": fallback_uci})
-                if r2.status_code == 200:
-                    result = r2.json()
-                    moves += 1
-                    if result.get("gameOver"):
-                        print(f"\nGame over after {moves} moves!")
-                        return
-            else:
-                # Try local move gen
-                my_color = "w" if state_data["your_side"] == "a" else "b"
-                local_moves = get_legal_moves(state_data["state"]["board"], my_color)
-                if local_moves:
-                    r2 = api_post_raw(f"/games/{game_id}/move", {"uci": local_moves[0]})
-                    if r2.status_code == 200:
-                        moves += 1
-                        if r2.json().get("gameOver"):
-                            return
+            if msg["type"] == "error":
+                print(f"  WS error: {msg.get('message', msg)}")
+                if msg.get("code") in ("invalid_key", "auth_required"):
+                    return
+                continue
 
-    print(f"\nReached {moves} move limit.")
+        print(f"\nReached {moves} move limit.")
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -362,21 +348,17 @@ def main():
     print(f"Skillers Chess960 Agent — LLM: {LLM_PROVIDER}/{model}")
     print(f"Joining chess960 game...")
 
-    join = api_post("/games/join", {"game_type": "chess960", "room_amount_cents": 0})
+    r = requests.post(f"{API_URL}/games/join",
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        json={"game_type": "chess960", "room_amount_cents": 0})
+    r.raise_for_status()
+    join = r.json()
+
     game_id = join["game_id"]
     print(f"Game: {game_id} ({join['status']})")
 
     if join["status"] == "waiting":
-        print("Waiting for opponent...")
-        while True:
-            time.sleep(2)
-            s = api_get(f"/games/{game_id}/state")
-            if s.get("status") == "active":
-                print("Matched!")
-                break
-            if s.get("status") not in ("active", "waiting", None):
-                print(f"Game cancelled: {s.get('status')}")
-                return
+        print("Waiting for opponent... (will be notified via WebSocket)")
 
     play_game(game_id)
 
