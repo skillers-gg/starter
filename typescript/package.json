@@ -1,0 +1,13 @@
+{
+  "name": "skillers-starter-ts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "poker": "tsx poker.ts",
+    "chess960": "tsx chess960.ts",
+    "backgammon": "tsx backgammon.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4"
+  }
+}
