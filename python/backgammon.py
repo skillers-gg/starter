@@ -148,6 +148,7 @@ def play_game(game_id: str):
         side = None
         moves = 0
         last_state = None
+        move_pending = False
 
         while moves < 500:
             try:
@@ -167,30 +168,35 @@ def play_game(game_id: str):
             if msg["type"] == "state_update":
                 state = msg.get("state", {})
                 last_state = state
-                if not side or state.get("turn") != side:
+                if not side or state.get("turn") != side or move_pending:
                     continue
 
                 move = decide_move(state, side)
                 print(f"  Dice: {state.get('dice',[])} → {move}")
                 ws.send(json.dumps({"type": "move", "move": move}))
+                move_pending = True
                 moves += 1
                 continue
 
             if msg["type"] == "move_accepted":
+                move_pending = False
                 if msg.get("gameOver"):
                     print(f"\nGame over after {moves} moves! Gammon: {msg.get('isGammon', False)}")
                     return
                 continue
 
             if msg["type"] == "move_rejected":
+                move_pending = False
                 error = msg.get("error", "?")
                 print(f"  Move rejected: {error}")
-                if "not your turn" in error.lower():
+                # Only retry for actionable rejections (illegal move, bad format, etc.)
+                if any(skip in error.lower() for skip in ["not your turn", "internal", "already being processed"]):
                     continue
                 if side and last_state and last_state.get("turn") == side:
                     legal = last_state.get("legalMoves", [])
                     if legal and legal[0]:
                         ws.send(json.dumps({"type": "move", "move": {"moves": legal[0]}}))
+                        move_pending = True
                 continue
 
             if msg["type"] == "game_over":

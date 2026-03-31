@@ -181,12 +181,13 @@ function playGame(gameId: string): Promise<void> {
           moves++;
         } catch (e: any) {
           console.error("  Error:", e.message);
+          processing = false;
         }
-        processing = false;
         return;
       }
 
       if (msg.type === "move_accepted") {
+        processing = false;
         if (msg.gameOver) {
           console.log(`\nGame over after ${moves} moves! Gammon: ${msg.isGammon || false}`);
           clearInterval(pingInterval);
@@ -197,13 +198,17 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
+        processing = false;
         const error = msg.error || "?";
         console.log(`  Move rejected: ${error}`);
-        if (error.toLowerCase().includes("not your turn")) return;
+        // Only retry for actionable rejections (illegal move, bad format, etc.)
+        const el = error.toLowerCase();
+        if (el.includes("not your turn") || el.includes("internal") || el.includes("already being processed")) return;
         if (side && lastState && lastState.turn === side) {
           const legal = lastState.legalMoves || [];
           if (legal.length && legal[0].length) {
             ws.send(JSON.stringify({ type: "move", move: { moves: legal[0] } }));
+            processing = true;
           }
         }
         return;

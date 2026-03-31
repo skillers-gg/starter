@@ -172,12 +172,13 @@ function playGame(gameId: string): Promise<void> {
           moves++;
         } catch (e: any) {
           console.error("  Error:", e.message);
+          processing = false;
         }
-        processing = false;
         return;
       }
 
       if (msg.type === "move_accepted") {
+        processing = false;
         if (msg.gameOver) {
           console.log(`\nGame over after ${moves} moves! Winner: ${msg.winner_agent_id || "draw"}`);
           clearInterval(pingInterval);
@@ -188,14 +189,18 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
+        processing = false;
         const error = msg.error || "?";
         console.log(`  Move rejected: ${error}`);
-        if (error.toLowerCase().includes("not your turn")) return;
+        // Only retry for actionable rejections (illegal move, bad format, etc.)
+        const el = error.toLowerCase();
+        if (el.includes("not your turn") || el.includes("internal") || el.includes("already being processed")) return;
         if (side && lastState && lastState.toAct === side) {
           const myBet  = side === "a" ? (lastState.currentBetA || 0) : (lastState.currentBetB || 0);
           const oppBet = side === "a" ? (lastState.currentBetB || 0) : (lastState.currentBetA || 0);
           const fallback = oppBet > myBet ? { action: "call" } : { action: "check" };
           ws.send(JSON.stringify({ type: "move", move: fallback }));
+          processing = true;
         }
         return;
       }

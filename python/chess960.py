@@ -276,6 +276,7 @@ def play_game(game_id: str):
         side = None
         moves = 0
         last_state = None
+        move_pending = False
 
         while moves < 600:
             try:
@@ -295,36 +296,42 @@ def play_game(game_id: str):
             if msg["type"] == "state_update":
                 state = msg.get("state", {})
                 last_state = state
-                if not side or not is_my_turn(state, side):
+                if not side or not is_my_turn(state, side) or move_pending:
                     continue
 
                 move = decide_move(state, side)
                 my_color = "w" if side == "a" else "b"
                 print(f"  Move {state.get('fullMoves','?')} ({my_color}) → {move['uci']}")
                 ws.send(json.dumps({"type": "move", "move": move}))
+                move_pending = True
                 moves += 1
                 continue
 
             if msg["type"] == "move_accepted":
+                move_pending = False
                 if msg.get("gameOver"):
                     print(f"\nGame over after {moves} moves! Status: {msg.get('status', '?')}")
                     return
                 continue
 
             if msg["type"] == "move_rejected":
+                move_pending = False
                 error = msg.get("error", "?")
                 print(f"  Move rejected: {error}")
-                if "not your turn" in error.lower():
+                # Only retry for actionable rejections (illegal move, bad format, etc.)
+                if any(skip in error.lower() for skip in ["not your turn", "internal", "already being processed"]):
                     continue
                 legal = msg.get("legal_moves", [])
                 if legal:
                     print(f"  Using server legal move: {legal[0]}")
                     ws.send(json.dumps({"type": "move", "move": {"uci": legal[0]}}))
+                    move_pending = True
                 elif side and last_state and is_my_turn(last_state, side):
                     my_color = "w" if side == "a" else "b"
                     local = get_legal_moves(last_state["board"], my_color)
                     if local:
                         ws.send(json.dumps({"type": "move", "move": {"uci": local[0]}}))
+                        move_pending = True
                 continue
 
             if msg["type"] == "game_over":

@@ -146,6 +146,7 @@ def play_game(game_id: str):
         side = None
         moves = 0
         last_state = None
+        move_pending = False
 
         while moves < 500:
             try:
@@ -165,7 +166,7 @@ def play_game(game_id: str):
             if msg["type"] == "state_update":
                 state = msg.get("state", {})
                 last_state = state
-                if not side or state.get("toAct") != side:
+                if not side or state.get("toAct") != side or move_pending:
                     continue
 
                 move = decide_move(state, side)
@@ -173,10 +174,12 @@ def play_game(game_id: str):
                 print(f"  Hand {s.get('handNumber','?')} [{s.get('stage','?')}] "
                       f"Cards: {s.get('holeCards',[])} Board: {s.get('community',[])} → {move}")
                 ws.send(json.dumps({"type": "move", "move": move}))
+                move_pending = True
                 moves += 1
                 continue
 
             if msg["type"] == "move_accepted":
+                move_pending = False
                 if msg.get("gameOver"):
                     winner = msg.get("winner_agent_id", "draw")
                     print(f"\nGame over after {moves} moves! Winner: {winner}")
@@ -184,15 +187,18 @@ def play_game(game_id: str):
                 continue
 
             if msg["type"] == "move_rejected":
+                move_pending = False
                 error = msg.get("error", "?")
                 print(f"  Move rejected: {error}")
-                if "not your turn" in error.lower():
+                # Only retry for actionable rejections (illegal move, bad format, etc.)
+                if any(skip in error.lower() for skip in ["not your turn", "internal", "already being processed"]):
                     continue
                 if side and last_state and last_state.get("toAct") == side:
                     my_bet  = last_state.get("currentBetA", 0) if side == "a" else last_state.get("currentBetB", 0)
                     opp_bet = last_state.get("currentBetB", 0) if side == "a" else last_state.get("currentBetA", 0)
                     fallback = {"action": "call"} if opp_bet > my_bet else {"action": "check"}
                     ws.send(json.dumps({"type": "move", "move": fallback}))
+                    move_pending = True
                 continue
 
             if msg["type"] == "game_over":

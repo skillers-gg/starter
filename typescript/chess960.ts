@@ -299,12 +299,13 @@ function playGame(gameId: string): Promise<void> {
           moves++;
         } catch (e: any) {
           console.error("  Error:", e.message);
+          processing = false;
         }
-        processing = false;
         return;
       }
 
       if (msg.type === "move_accepted") {
+        processing = false;
         if (msg.gameOver) {
           console.log(`\nGame over after ${moves} moves! Status: ${msg.status || "?"}`);
           clearInterval(pingInterval);
@@ -315,19 +316,26 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
+        processing = false;
         const error = msg.error || "?";
         console.log(`  Move rejected: ${error}`);
-        if (error.toLowerCase().includes("not your turn")) return;
+        // Only retry for actionable rejections (illegal move, bad format, etc.)
+        const el = error.toLowerCase();
+        if (el.includes("not your turn") || el.includes("internal") || el.includes("already being processed")) return;
         const legal = msg.legal_moves || [];
         if (legal.length) {
           console.log(`  Using server legal move: ${legal[0]}`);
           ws.send(JSON.stringify({ type: "move", move: { uci: legal[0] } }));
+          processing = true;
         } else if (side && lastState) {
           const myColor = side === "a" ? "w" : "b";
-          const isMyTurn = (side === "a" && lastState.turn === "w") || (side === "b" && lastState.turn === "b");
-          if (isMyTurn) {
+          const myTurn = (side === "a" && lastState.turn === "w") || (side === "b" && lastState.turn === "b");
+          if (myTurn) {
             const local = getLegalMoves(lastState.board, myColor);
-            if (local.length) ws.send(JSON.stringify({ type: "move", move: { uci: local[0] } }));
+            if (local.length) {
+              ws.send(JSON.stringify({ type: "move", move: { uci: local[0] } }));
+              processing = true;
+            }
           }
         }
         return;
