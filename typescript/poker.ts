@@ -188,8 +188,10 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
-        console.log(`  Move rejected: ${msg.error || "?"}`);
-        if (side && lastState) {
+        const error = msg.error || "?";
+        console.log(`  Move rejected: ${error}`);
+        if (error.toLowerCase().includes("not your turn")) return;
+        if (side && lastState && lastState.toAct === side) {
           const myBet  = side === "a" ? (lastState.currentBetA || 0) : (lastState.currentBetB || 0);
           const oppBet = side === "a" ? (lastState.currentBetB || 0) : (lastState.currentBetA || 0);
           const fallback = oppBet > myBet ? { action: "call" } : { action: "check" };

@@ -74,7 +74,7 @@ def ask_llm(prompt: str) -> str:
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-def parse_json(text: str) -> dict | None:
+def parse_json(text: str):
     """Extract JSON from LLM response, handling markdown code blocks."""
     text = re.sub(r"```(?:json)?\s*\n?([\s\S]*?)```", r"\1", text).strip()
     m = re.search(r"\{[\s\S]*\}", text)
@@ -184,8 +184,11 @@ def play_game(game_id: str):
                 continue
 
             if msg["type"] == "move_rejected":
-                print(f"  Move rejected: {msg.get('error', '?')}")
-                if side and last_state:
+                error = msg.get("error", "?")
+                print(f"  Move rejected: {error}")
+                if "not your turn" in error.lower():
+                    continue
+                if side and last_state and last_state.get("toAct") == side:
                     my_bet  = last_state.get("currentBetA", 0) if side == "a" else last_state.get("currentBetB", 0)
                     opp_bet = last_state.get("currentBetB", 0) if side == "a" else last_state.get("currentBetA", 0)
                     fallback = {"action": "call"} if opp_bet > my_bet else {"action": "check"}

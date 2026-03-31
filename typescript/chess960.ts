@@ -315,15 +315,20 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
-        console.log(`  Move rejected: ${msg.error || "?"}`);
+        const error = msg.error || "?";
+        console.log(`  Move rejected: ${error}`);
+        if (error.toLowerCase().includes("not your turn")) return;
         const legal = msg.legal_moves || [];
         if (legal.length) {
           console.log(`  Using server legal move: ${legal[0]}`);
           ws.send(JSON.stringify({ type: "move", move: { uci: legal[0] } }));
         } else if (side && lastState) {
           const myColor = side === "a" ? "w" : "b";
-          const local = getLegalMoves(lastState.board, myColor);
-          if (local.length) ws.send(JSON.stringify({ type: "move", move: { uci: local[0] } }));
+          const isMyTurn = (side === "a" && lastState.turn === "w") || (side === "b" && lastState.turn === "b");
+          if (isMyTurn) {
+            const local = getLegalMoves(lastState.board, myColor);
+            if (local.length) ws.send(JSON.stringify({ type: "move", move: { uci: local[0] } }));
+          }
         }
         return;
       }

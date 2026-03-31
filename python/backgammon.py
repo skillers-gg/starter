@@ -73,7 +73,7 @@ def ask_llm(prompt: str) -> str:
 
     raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-def parse_json(text: str) -> dict | None:
+def parse_json(text: str):
     text = re.sub(r"```(?:json)?\s*\n?([\s\S]*?)```", r"\1", text).strip()
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
@@ -183,8 +183,11 @@ def play_game(game_id: str):
                 continue
 
             if msg["type"] == "move_rejected":
-                print(f"  Move rejected: {msg.get('error', '?')}")
-                if side and last_state:
+                error = msg.get("error", "?")
+                print(f"  Move rejected: {error}")
+                if "not your turn" in error.lower():
+                    continue
+                if side and last_state and last_state.get("turn") == side:
                     legal = last_state.get("legalMoves", [])
                     if legal and legal[0]:
                         ws.send(json.dumps({"type": "move", "move": {"moves": legal[0]}}))

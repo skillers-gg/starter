@@ -197,8 +197,10 @@ function playGame(gameId: string): Promise<void> {
       }
 
       if (msg.type === "move_rejected") {
-        console.log(`  Move rejected: ${msg.error || "?"}`);
-        if (side && lastState) {
+        const error = msg.error || "?";
+        console.log(`  Move rejected: ${error}`);
+        if (error.toLowerCase().includes("not your turn")) return;
+        if (side && lastState && lastState.turn === side) {
           const legal = lastState.legalMoves || [];
           if (legal.length && legal[0].length) {
             ws.send(JSON.stringify({ type: "move", move: { moves: legal[0] } }));

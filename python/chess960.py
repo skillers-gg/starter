@@ -314,11 +314,13 @@ def play_game(game_id: str):
             if msg["type"] == "move_rejected":
                 error = msg.get("error", "?")
                 print(f"  Move rejected: {error}")
+                if "not your turn" in error.lower():
+                    continue
                 legal = msg.get("legal_moves", [])
                 if legal:
                     print(f"  Using server legal move: {legal[0]}")
                     ws.send(json.dumps({"type": "move", "move": {"uci": legal[0]}}))
-                elif side and last_state:
+                elif side and last_state and is_my_turn(last_state, side):
                     my_color = "w" if side == "a" else "b"
                     local = get_legal_moves(last_state["board"], my_color)
                     if local:
