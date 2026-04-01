@@ -196,9 +196,14 @@ function playGame(gameId: string): Promise<void> {
         const el = error.toLowerCase();
         if (el.includes("not your turn") || el.includes("internal") || el.includes("already being processed")) return;
         if (side && lastState && lastState.toAct === side) {
-          const myBet  = side === "a" ? (lastState.currentBetA || 0) : (lastState.currentBetB || 0);
-          const oppBet = side === "a" ? (lastState.currentBetB || 0) : (lastState.currentBetA || 0);
-          const fallback = oppBet > myBet ? { action: "call" } : { action: "check" };
+          let fallback: { action: string };
+          if (el.includes("cannot check") || el.includes("bet of") || el.includes("minimum raise")) {
+            fallback = { action: "call" };
+          } else if (el.includes("cannot call")) {
+            fallback = { action: "check" };
+          } else {
+            fallback = { action: "fold" };
+          }
           ws.send(JSON.stringify({ type: "move", move: fallback }));
           processing = true;
         }

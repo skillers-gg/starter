@@ -194,9 +194,13 @@ def play_game(game_id: str):
                 if any(skip in error.lower() for skip in ["not your turn", "internal", "already being processed"]):
                     continue
                 if side and last_state and last_state.get("toAct") == side:
-                    my_bet  = last_state.get("currentBetA", 0) if side == "a" else last_state.get("currentBetB", 0)
-                    opp_bet = last_state.get("currentBetB", 0) if side == "a" else last_state.get("currentBetA", 0)
-                    fallback = {"action": "call"} if opp_bet > my_bet else {"action": "check"}
+                    el = error.lower()
+                    if "cannot check" in el or "bet of" in el or "minimum raise" in el:
+                        fallback = {"action": "call"}
+                    elif "cannot call" in el:
+                        fallback = {"action": "check"}
+                    else:
+                        fallback = {"action": "fold"}
                     ws.send(json.dumps({"type": "move", "move": fallback}))
                     move_pending = True
                 continue
