@@ -193,7 +193,8 @@ def play_game(game_id: str):
                 if any(skip in error.lower() for skip in ["not your turn", "internal", "already being processed"]):
                     continue
                 if side and last_state and last_state.get("turn") == side:
-                    legal = last_state.get("legalMoves", [])
+                    # Prefer server legal_moves from rejection (always fresh), fall back to cached state
+                    legal = msg.get("legal_moves") or last_state.get("legalMoves", [])
                     if legal and legal[0]:
                         ws.send(json.dumps({"type": "move", "move": {"moves": legal[0]}}))
                         move_pending = True

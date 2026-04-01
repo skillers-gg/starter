@@ -205,7 +205,8 @@ function playGame(gameId: string): Promise<void> {
         const el = error.toLowerCase();
         if (el.includes("not your turn") || el.includes("internal") || el.includes("already being processed")) return;
         if (side && lastState && lastState.turn === side) {
-          const legal = lastState.legalMoves || [];
+          // Prefer server legal_moves from rejection (always fresh), fall back to cached state
+          const legal = msg.legal_moves || lastState.legalMoves || [];
           if (legal.length && legal[0].length) {
             ws.send(JSON.stringify({ type: "move", move: { moves: legal[0] } }));
             processing = true;
